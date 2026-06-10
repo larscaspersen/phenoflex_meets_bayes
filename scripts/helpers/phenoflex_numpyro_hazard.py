@@ -4,7 +4,7 @@ import jax
 from jax.nn import sigmoid
 import jax.numpy as jnp  # Ensure jnp is imported
 from numpyro.contrib.control_flow import scan
-from helpers.phenoflex_numpyro import _p1z_jax, _p2z_jax, _pfcn_jax
+from helpers.phenoflex_numpyro import _p1z_jax, _p2z_jax, _pfcn_jax, convert_intermediate_params
 
 
 # ── Hazard function ─────────────────────────────────────────────────
@@ -67,6 +67,7 @@ def phenoflex_numpyro_hazard(
     Imodel=0,
     deg_celsius=True,
     return_traces=False,  # New flag for conditional return
+    use_intermediate_params=False,  # If True, sample theta_star/theta_c/tau/pie_c and convert
 ):
     """
     Numpyro probabilistic wrapper around PhenoFlex.
@@ -84,9 +85,12 @@ def phenoflex_numpyro_hazard(
                     Pass None for prior predictive / generative mode.
     Imodel        : 0 = GDH triangular bell, 1 = Gaussian
     deg_celsius   : True if temperatures arrive in Celsius
-    sharpness     : steepness of the soft bloom-date estimator.
-                    Increase if the posterior is diffuse; decrease if gradients vanish.
     return_traces : If True, x_trace, y_trace, and z_trace will be returned as deterministic outputs.
+    use_intermediate_params : If True, sample the intermediate chill-submodel parameters
+                    (theta_star, theta_c, tau, pie_c) instead of E0/E1/A0/A1 directly.
+                    Conversion to E0/E1/A0/A1 follows Fishman et al. (1987) /
+                    Egea et al. (2021).  The converted values are registered as
+                    numpyro deterministics so they appear in the posterior.
     """
 
     # ── Priors ────────────────────────────────────────────────────────────────
@@ -94,12 +98,30 @@ def phenoflex_numpyro_hazard(
     zc = numpyro.sample("zc", dist.Normal(220.0, 30.0))
     k = numpyro.sample("k", dist.LogNormal(0.0, 1.0))
     s1 = numpyro.sample("s1", dist.Beta(2.0, 2.0))
-    E0 = numpyro.sample("E0", dist.Normal(4153.5, 200.0))
-    E1 = numpyro.sample("E1", dist.Normal(12888.8, 500.0))
-    A0 = numpyro.sample(
-        "A0", dist.HalfNormal(139500)
-    )  # Changed to HalfNormal as values are positive
-    A1 = numpyro.sample("A1", dist.HalfNormal(2.567e18))  # Changed to HalfNormal
+
+    if use_intermediate_params:
+        # Sample intermediate parameters — temperatures in Kelvin, constrained positive
+        # Using TransformedDistribution via constraints to keep theta > 0
+        theta_star = numpyro.sample("theta_star", dist.Uniform(279.0, 281.0))   # K, Egea 2021
+        theta_c    = numpyro.sample("theta_c",    dist.Uniform(286.0, 287.0))   # K, Egea 2021
+        tau        = numpyro.sample("tau",        dist.Uniform(16.0,  48.0))    # h, Egea 2021
+        pie_c      = numpyro.sample("pie_c",      dist.Uniform(24.0,  28.0))    # h, Egea 2021
+        # Convert to standard PhenoFlex parameters — pure JAX, works inside traced model
+        E0, E1, A0, A1 = convert_intermediate_params(
+            theta_star, theta_c, tau, pie_c
+        )
+        E0 = numpyro.deterministic("E0", E0)
+        E1 = numpyro.deterministic("E1", E1)
+        A0 = numpyro.deterministic("A0", A0)
+        A1 = numpyro.deterministic("A1", A1)
+    else:
+        E0 = numpyro.sample("E0", dist.Normal(4153.5, 200.0))
+        E1 = numpyro.sample("E1", dist.Normal(12888.8, 500.0))
+        A0 = numpyro.sample(
+            "A0", dist.HalfNormal(139500)
+        )  # Changed to HalfNormal as values are positive
+        A1 = numpyro.sample("A1", dist.HalfNormal(2.567e18))  # Changed to HalfNormal
+
     Tf = numpyro.sample("Tf", dist.Normal(4.0, 1.0))
     slope = numpyro.sample("slope", dist.HalfNormal(1.6))
     Tb = numpyro.sample("Tb", dist.Normal(4.0, 2.0))

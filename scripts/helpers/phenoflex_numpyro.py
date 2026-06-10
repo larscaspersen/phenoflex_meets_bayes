@@ -1,7 +1,9 @@
+import jax
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 from numpyro.contrib.control_flow import scan
+import numpy as np
 
 
 def _p1z_jax(T, Tu, Tb, Tc):
@@ -27,6 +29,65 @@ def _pfcn_jax(T, Tf, slope):
     # x = slope * Tf * (T - Tf) / T
     # sr = jnp.exp(jnp.clip(x, -20, 17))
     # return jnp.where(x >= 17, 1.0, jnp.where(x <= -20, 0.0, sr / (1 + sr)))
+
+
+# ── Intermediate-parameter conversion ───────────────────────────────────────
+def convert_intermediate_params(theta_star, theta_c, tau, pie_c):
+    """
+    Convert intermediate chill-submodel parameters to standard PhenoFlex
+    parameters (E0, E1, A0, A1).
+
+    Fully JAX-native: uses Newton's method via jax.lax.fori_loop so it works
+    inside a traced/JIT-compiled numpyro model.
+
+    Follows Fishman et al. (1987) and Egea et al. (2021), equations 5-8.
+
+    Parameters
+    ----------
+    theta_star : JAX scalar — reference temperature 1 (K), typically ~279-281
+    theta_c    : JAX scalar — reference temperature 2 (K), typically ~286-287
+    tau        : JAX scalar — time constant at theta_star (h), typically 16-48
+    pie_c      : JAX scalar — equilibrium chill at theta_c, typically 24-28
+
+    Returns
+    -------
+    E0, E1, A0, A1 : JAX scalars
+    """
+    def nle_and_jac(E):
+        E0, E1 = E[0], E[1]
+        # Clip to avoid overflow in exp
+        e0s = jnp.exp(jnp.clip(E0 / theta_star, -500.0, 500.0))
+        e1s = jnp.exp(jnp.clip(E1 / theta_star, -500.0, 500.0))
+        e0c = jnp.exp(jnp.clip(E0 / theta_c,    -500.0, 500.0))
+        e1c = jnp.exp(jnp.clip(E1 / theta_c,    -500.0, 500.0))
+        # NLE system (chillR / Egea 2021)
+        f = jnp.array([
+            2.0 * e0s - pie_c * (e1s + 1.0),
+            2.0 * e0c - pie_c * (e1c + 1.0),
+        ])
+        # Analytical Jacobian
+        J = jnp.array([
+            [ 2.0 / theta_star * e0s,  -pie_c / theta_star * e1s],
+            [ 2.0 / theta_c   * e0c,  -pie_c / theta_c   * e1c],
+        ])
+        return f, J
+
+    def newton_step(i, E):
+        f, J = nle_and_jac(E)
+        delta = jnp.linalg.solve(J, f)
+        return E - delta
+
+    E_init = jnp.array([500.0, 15000.0])
+    E_sol  = jax.lax.fori_loop(0, 50, newton_step, E_init)
+
+    E0, E1 = E_sol[0], E_sol[1]
+
+    # Analytical A1 and A0 (Egea 2021 Eq. 36-37)
+    q  = 1.0 / theta_star - 1.0 / theta_c
+    A1 = -jnp.exp(E1 / theta_star) / tau * jnp.log(1.0 - jnp.exp((E0 - E1) * q))
+    A0 = A1 * jnp.exp((E0 - E1) / theta_c)
+
+    return E0, E1, A0, A1
 
 
 # ── Soft bloom-date estimator ─────────────────────────────────────────────────
