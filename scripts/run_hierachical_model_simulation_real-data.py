@@ -3,6 +3,7 @@
 #run simulation study on hierachical phenoflex model
 import argparse
 import os
+import sys
 import time
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,14 +22,45 @@ from numpyro.infer import MCMC, NUTS, Predictive
 import json
 import pandas as pd
 
-#custom functions
-from helpers.helpers_hierachical_model import gen_season_list, prepare_seasons_hierarchical, phenoflex_numpyro_hierarchical, get_jday_from_hour, phenoflex_model_with_custom_priors, solve_for_log_normal_parameters, run_inference, DEFAULT_PRIORS
-from helpers.helpers_hierachical_model import phenoflex_model_with_custom_priors_slim, phenoflex_numpyro_hierarchical_slim
+parser = argparse.ArgumentParser(description="Run hierarchical model on real data.")
+parser.add_argument(
+    "--run_cluster",
+    action="store_true",
+    help="Use cluster-specific absolute paths for helpers, input data, and outputs.",
+)
+args = parser.parse_args()
+
+run_cluster = args.run_cluster
+
+if run_cluster:
+    HELPERS_FILE = "/home/lcaspers_hpc/code/pheno_bayes/helpers/helpers_hierachical_model.py"
+    INPUT_BASE_DIR = "/home/lcaspers_hpc/data/calibration_hierach_model/in"
+    OUTPUT_DIR = "/home/lcaspers_hpc/data/calibration_hierach_model/out/calibrated_models"
+
+    helpers_dir = os.path.dirname(HELPERS_FILE)
+    if helpers_dir not in sys.path:
+        sys.path.insert(0, helpers_dir)
+
+    from helpers_hierachical_model import gen_season_list, prepare_seasons_hierarchical, phenoflex_numpyro_hierarchical, get_jday_from_hour, phenoflex_model_with_custom_priors, solve_for_log_normal_parameters, run_inference, DEFAULT_PRIORS
+    from helpers_hierachical_model import phenoflex_model_with_custom_priors_slim, phenoflex_numpyro_hierarchical_slim
+else:
+    INPUT_BASE_DIR = "."
+    OUTPUT_DIR = "calibrated_models"
+
+    # custom functions (local workspace layout)
+    from helpers.helpers_hierachical_model import gen_season_list, prepare_seasons_hierarchical, phenoflex_numpyro_hierarchical, get_jday_from_hour, phenoflex_model_with_custom_priors, solve_for_log_normal_parameters, run_inference, DEFAULT_PRIORS
+    from helpers.helpers_hierachical_model import phenoflex_model_with_custom_priors_slim, phenoflex_numpyro_hierarchical_slim
+
+PHENOLOGY_DIR = os.path.join(INPUT_BASE_DIR, "phenology")
+WEATHER_DIR = os.path.join(INPUT_BASE_DIR, "weather_hourly")
+PRIORS_DIR = os.path.join(INPUT_BASE_DIR, "priors")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 n_chain = 1
-n_warmup = 500
-n_samples = 1000
+n_warmup = 100
+n_samples = 200
 use_slim_model = True
 truncate_days_after_bloom=45
 
@@ -36,43 +68,58 @@ numpyro.set_host_device_count(n_chain)
 
 
 # Free-text notes saved to the protocol JSON — describe what you changed or observed
-NOTES = """longer run, two chains"""
+NOTES = """all adamedor data, longer"""
 
-numpyro.set_host_device_count(n_chain)
+# Map location names (as they appear in phenology data) to weather CSV filenames
+LOCATION_WEATHER_FILES = {
+    'Cieza':          os.path.join(WEATHER_DIR, 'cieza_hourly.csv'),
+    'Klein-Altendorf':os.path.join(WEATHER_DIR, 'klein-altendorf_hourly.csv'),
+    'Meknes':         os.path.join(WEATHER_DIR, 'meknes_hourly.csv'),
+    'Santomera':      os.path.join(WEATHER_DIR, 'santomera_hourly.csv'),
+    'Sfax':           os.path.join(WEATHER_DIR, 'sfax_hourly.csv'),
+    'Zaragoza':       os.path.join(WEATHER_DIR, 'zaragoza_hourly.csv'),
+}
 
-
-KA_temp_hourly = pd.read_csv("weather_hourly/klein-altendorf_hourly.csv")
+# Read all weather files
+weather_data = {loc: pd.read_csv(fpath) for loc, fpath in LOCATION_WEATHER_FILES.items()}
 
 #read adamedor data
-adamedor = pd.read_csv("phenology/adamedor_sub.csv")
+adamedor = pd.read_csv(os.path.join(PHENOLOGY_DIR, "adamedor_sub.csv"))
 adamedor = adamedor.rename(columns={'year': 'Year', 'cultivar': 'cultivar_id', 'species': 'species_id', 'location': 'location_id', 'pheno': 'pheno'})
 
-#take apple data, from klein-altendorf
-adamedor_apple = adamedor[(adamedor['species_id'] == 'Apple') & (adamedor['location_id'] == 'Klein-Altendorf') & (adamedor['Year'] > 1958)]
-adamedor_cherry = adamedor[(adamedor['species_id'] == 'Sweet Cherry') & (adamedor['location_id'] == 'Klein-Altendorf') & (adamedor['Year'] > 1958)]
+# Make cultivar names unique across species by appending a species abbreviation
+SPECIES_ABBREV = {
+    'Almond':        'AL',
+    'Apple':         'AP',
+    'Apricot':       'AR',
+    'European Plum': 'EP',
+    'Japanese Plum': 'JP',
+    'Pear':          'PE',
+    'Pistachio':     'PI',
+    'Sweet Cherry':  'SC',
+}
+adamedor['cultivar_id'] = adamedor['cultivar_id'] + '_' + adamedor['species_id'].map(SPECIES_ABBREV)
 
-#combine both
-cka_pheno = pd.concat([adamedor_apple, adamedor_cherry], ignore_index=True)
+cka_pheno = adamedor.copy()
 
-#get unique years in adamedor_apple
-unique_years = cka_pheno['Year'].unique()
-seasons = gen_season_list(KA_temp_hourly, years=unique_years)
+# Drop Zaragoza 2022 observations (no matching weather data)
+cka_pheno = cka_pheno[~((cka_pheno['location_id'] == 'Zaragoza') & (cka_pheno['Year'] == 2022))]
 
-# The 'seasons' variable is a list of DataFrames, but prepare_seasons_hierarchical expects a dictionary.
-# We need to transform 'seasons' into a dictionary with (location_id, year) as keys.
+# Build season_dict_for_hierarchical: keys are (location, year), covering all locations
 season_dict_for_hierarchical = {}
-location = 'Klein-Altendorf' # All seasons currently generated are for this location
-
-for i, year in enumerate(unique_years):
-    # Assuming all seasons in 'seasons' list correspond to the same location
-    # and are in the order of 'years' array.
-    season_dict_for_hierarchical[(location, year)] = seasons[i]
+for loc, temps_df in weather_data.items():
+    loc_years = cka_pheno.loc[cka_pheno['location_id'] == loc, 'Year'].unique()
+    if len(loc_years) == 0:
+        continue
+    loc_seasons = gen_season_list(temps_df, years=loc_years)
+    for year, season in zip(loc_years, loc_seasons):
+        season_dict_for_hierarchical[(loc, year)] = season
 
 temps, times, bloom_indices, cultivar_idx, location_idx, cultivar_to_species, cultivar_names, species_names, location_names = prepare_seasons_hierarchical(season_dict=season_dict_for_hierarchical, bloom_df=cka_pheno, truncate_days_after_bloom=truncate_days_after_bloom)
 
 #load prior species
-prior_species = pd.read_csv("priors/prior_species_stats_hierarchical.csv")
-prior_cultivar = pd.read_csv("priors/prior_allcultivars_hierarchical.csv")
+prior_species = pd.read_csv(os.path.join(PRIORS_DIR, "prior_species_stats_hierarchical.csv"))
+prior_cultivar = pd.read_csv(os.path.join(PRIORS_DIR, "prior_allcultivars_hierarchical.csv"))
 
 #print(prior_species.head())
 #print(prior_cultivar.head())
@@ -82,7 +129,13 @@ prior_cultivar = pd.read_csv("priors/prior_allcultivars_hierarchical.csv")
 #filter prior species and prior cultivar depending on cka_pheno
 #make sure the order is the same
 prior_species_filtered = prior_species[prior_species['Species'].isin(species_names)]
-prior_species_filtered = prior_species_filtered.set_index('Species').loc[species_names].reset_index()
+prior_species_filtered = (
+    prior_species_filtered
+    .set_index('Species')
+    .reindex(species_names)          # NaN rows for species not in prior
+    .fillna(prior_species_filtered.set_index('Species').mean())  # fill with across-species mean
+    .reset_index()
+)
 
 #filter for cultivars
 prior_cultivar_filtered = prior_cultivar[prior_cultivar['Cultivar'].isin(cultivar_names)]
@@ -213,24 +266,24 @@ from datetime import datetime
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
 # ── File names (shared across all saved artefacts) ────────────────────────────
-pheno_file          = "phenology/adamedor_sub.csv"
+pheno_file           = os.path.join(PHENOLOGY_DIR, "adamedor_sub.csv")
 inference_data_fname = f"hierarchical_model_mcmc_inference_data_{timestamp}.nc"
 raw_samples_fname    = f"hierarchical_model_mcmc_raw_samples_{timestamp}.npz"
 training_data_fname  = f"hierarchical_model_training_data_{timestamp}.csv"
 protocol_fname       = f"hierarchical_model_protocol_{timestamp}.json"
 
 # --- ArviZ InferenceData ---
-az_mcmc_phenoflex.to_netcdf(f"calibrated_models/{inference_data_fname}")
+az_mcmc_phenoflex.to_netcdf(os.path.join(OUTPUT_DIR, inference_data_fname))
 print(f"Saved ArviZ InferenceData to {inference_data_fname}")
 
 # --- Raw MCMC samples (.npz) ---
 samples_to_save = {k: np.asarray(v) for k, v in mcmc_samples_phenoflex.items()}
-np.savez(f"calibrated_models/{raw_samples_fname}", **samples_to_save)
+np.savez(os.path.join(OUTPUT_DIR, raw_samples_fname), **samples_to_save)
 print(f"Saved raw MCMC samples to {raw_samples_fname}")
 
 # --- Training phenology data ---
 cka_pheno[["species_id", "cultivar_id", "Year", "pheno", "location_id"]].to_csv(
-    f"calibrated_models/{training_data_fname}", index=False
+    os.path.join(OUTPUT_DIR, training_data_fname), index=False
 )
 print(f"Saved training data to {training_data_fname}")
 
@@ -271,6 +324,6 @@ protocol = {
         "custom_priors":   {k: _prior_to_dict(v) for k, v in custom_priors.items()},
     },
 }
-with open(f"calibrated_models/{protocol_fname}", "w") as f:
+with open(os.path.join(OUTPUT_DIR, protocol_fname), "w") as f:
     json.dump(protocol, f, indent=2)
 print(f"Saved simulation protocol to {protocol_fname}")
