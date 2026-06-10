@@ -20,9 +20,10 @@ run_forward_prediction = False
 run_mcmc = True  # Set to False to skip MCMC and just run the predictive model
 show_plots = False
 timestamp_model = None  # Example timestamp for loading specific MCMC results
-n_chain = 4
-n_warmup = 1000
-n_samples = 1000
+intermed_par = True
+n_chain = 1
+n_warmup = 5
+n_samples = 10
 
 numpyro.set_host_device_count(n_chain)
 
@@ -38,15 +39,15 @@ FIXED_PARAMS = dict(
     # yc=40.0,
     # zc=190.0,
     # s1=0.5,
-    E0=4153.5,
-    E1=12888.8,
-    A0=139500.0,
-    A1=2.567e18,
-    Tf=4.0,
-    slope=1.6,
-    Tb=4.0,
-    Tu=26.0,
-    Tc=36.0,
+    #E0=4153.5,
+    #E1=12888.8,
+    #A0=139500.0,
+    #A1=2.567e18,
+    #Tf=4.0,
+    #slope=1.6,
+    #Tb=4.0,
+    #Tu=26.0,
+    #Tc=36.0,
     Delta=4.0,
 )
 
@@ -127,6 +128,8 @@ if run_mcmc:
         "times": times,
         "bloom_index": bloom_index,
         "Imodel": 0,  # Using the same Imodel as in the predictive run
+        "use_intermediate_params": intermed_par,  # Include intermediate parameters if the flag is set
+        "return_traces": False
     }
 
     # Define args for run_inference
@@ -154,7 +157,7 @@ if run_mcmc:
     # --- Saving az_mcmc_phenoflex (ArviZ InferenceData object) ---
     # This is the recommended way to save full inference results.
     # It saves all chains, samples, and diagnostics in a single file.
-    az_mcmc_phenoflex.to_netcdf(f"calibrated_models/mcmc_inference_data_{timestamp}.nc")
+    #az_mcmc_phenoflex.to_netcdf(f"calibrated_models/mcmc_inference_data_{timestamp}.nc")
     print("Saved ArviZ InferenceData to mcmc_inference_data.nc")
 
     # --- Saving mcmc_samples_phenoflex (dictionary of JAX arrays) ---
@@ -162,7 +165,7 @@ if run_mcmc:
     # First, convert JAX arrays to NumPy arrays if they aren't already.
     # NumPyro's MCMC.get_samples() typically returns JAX arrays.
     samples_to_save = {k: np.asarray(v) for k, v in mcmc_samples_phenoflex.items()}
-    np.savez(f"calibrated_models/mcmc_raw_samples_{timestamp}.npz", **samples_to_save)
+    #np.savez(f"calibrated_models/mcmc_raw_samples_{timestamp}.npz", **samples_to_save)
     print("Saved raw MCMC samples to mcmc_raw_samples.npz")
 
 if show_plots:
