@@ -90,6 +90,29 @@ def expected_bloom_time(z_trace, hours, zc, k):
     most_likely_hour = hours[jnp.argmax(pmf)] # Mode of the PMF
     return expected_hour, pmf, most_likely_hour
 
+# ── Module-level default priors (shared by both model variants) ───────────────
+# Import and merge with custom_priors in calling scripts to get effective priors.
+DEFAULT_PRIORS = {
+    "E0":         dist.Normal(4153.5,  200.0),
+    "E1":         dist.Normal(12888.8, 500.0),
+    "A0":         dist.HalfNormal(139500),
+    "A1":         dist.HalfNormal(2.567e18),
+    "Tf":         dist.Normal(4.0,  1.0),
+    "slope":      dist.HalfNormal(1.6),
+    "Tb":         dist.Normal(4.0,  2.0),
+    "Tu":         dist.Normal(26.0, 3.0),
+    "Tc":         dist.Normal(36.0, 3.0),
+    "Delta":      dist.HalfNormal(5.0),
+    "k":          dist.LogNormal(0.0, 1.0),
+    "s1":         dist.Beta(2.0, 2.0),
+    "yc_species": dist.LogNormal(jnp.log(65.0), 0.3),
+    "zc_species": dist.Normal(220.0, 30.0),
+    "yc_sigma":   dist.HalfNormal(10.0),
+    "zc_sigma":   dist.HalfNormal(20.0),
+    "yc_offset":  dist.Normal(0.0, 1.0),
+    "zc_offset":  dist.Normal(0.0, 1.0),
+}
+
 def phenoflex_numpyro_hierarchical(
     temp,
     times,
@@ -103,31 +126,8 @@ def phenoflex_numpyro_hierarchical(
     n_species=None,
     n_cultivars=None,
 ):
-    # ── Default priors ─────────────────────────────────────────────────────────
-    # Override any of these by passing priors={"yc_species": dist.Normal(...), ...}
-    default_priors = {
-        "E0":         dist.Normal(4153.5,  200.0),
-        "E1":         dist.Normal(12888.8, 500.0),
-        "A0":         dist.HalfNormal(139500),
-        "A1":         dist.HalfNormal(2.567e18),
-        "Tf":         dist.Normal(4.0,  1.0),
-        "slope":      dist.HalfNormal(1.6),
-        "Tb":         dist.Normal(4.0,  2.0),
-        "Tu":         dist.Normal(26.0, 3.0),
-        "Tc":         dist.Normal(36.0, 3.0),
-        "Delta":      dist.HalfNormal(5.0),
-        "k":          dist.LogNormal(0.0, 1.0),
-        "s1":         dist.Beta(2.0, 2.0),
-        "yc_species": dist.LogNormal(jnp.log(65.0), 0.3),
-        "zc_species": dist.Normal(220.0, 30.0),
-        "yc_sigma":   dist.HalfNormal(10.0),
-        "zc_sigma":   dist.HalfNormal(20.0),
-        "yc_offset":  dist.Normal(0.0, 1.0),
-        "zc_offset":  dist.Normal(0.0, 1.0),
-    }
-
     # User-supplied priors overwrite defaults — anything not supplied keeps its default
-    p = {**default_priors, **(priors or {})}
+    p = {**DEFAULT_PRIORS, **(priors or {})}
 
     # ── Sampling ───────────────────────────────────────────────────────────────
     if n_species is None:
@@ -238,7 +238,7 @@ def phenoflex_numpyro_hierarchical(
         numpyro.deterministic("bloom_pmf_pred",            pmfs)
         numpyro.deterministic("most_likely_bloom_hour_pred", most_likely_hours)
 
-def prepare_seasons_hierarchical(season_dict, bloom_df):
+def prepare_seasons_hierarchical(season_dict, bloom_df, truncate_days_after_bloom=None):
     """
     Prepare hierarchical model inputs from multi-cultivar, multi-location bloom data.
 
@@ -253,6 +253,11 @@ def prepare_seasons_hierarchical(season_dict, bloom_df):
                     cultivar_id — cultivar name  (e.g. "Gala")
                     species_id  — species name   (e.g. "apple")
                     location_id — location name  (e.g. "Karlsruhe")
+    truncate_days_after_bloom : int or None
+                    If given, each season's temperature series is cut off at
+                    (bloom_hour + truncate_days_after_bloom * 24) hours.
+                    Useful for calibration to reduce unnecessary computation.
+                    Default None keeps the full season.
 
     Returns
     -------
@@ -316,29 +321,12 @@ def prepare_seasons_hierarchical(season_dict, bloom_df):
         )
 
     # ── Build one entry per row in bloom_df ───────────────────────────────────
-    max_len = max(len(df) for df in season_dict.values())
-
-    padded_temps  = []
-    padded_times  = []
-    bloom_indices = []
-    cultivar_idx  = []
-    location_idx  = []
+    # First pass: locate bloom index, optionally truncate, collect slices.
+    # max_len is derived from the (possibly truncated) slices so padding is minimal.
+    raw_entries = []  # (season_df_slice, bloom_idx, cultivar_int, location_int)
 
     for row in bloom_df.itertuples():
         season_df = season_dict[(row.location_id, row.Year)]
-
-        # Pad temperature and time
-        temp  = jnp.asarray(season_df.Temp.values, dtype=jnp.float32)
-        t_idx = jnp.arange(len(temp), dtype=jnp.float32)
-        pad   = max_len - len(temp)
-
-        padded_temps.append(
-            jnp.pad(temp, (0, pad), mode="edge") if pad else temp
-        )
-        padded_times.append(
-            jnp.concatenate([t_idx, t_idx[-1] + jnp.arange(1, pad + 1, dtype=jnp.float32)])
-            if pad else t_idx
-        )
 
         # Locate bloom hour
         match_mask = (season_df["JDay"] == row.pheno) & (season_df["Year"] == row.Year)
@@ -356,10 +344,42 @@ def prepare_seasons_hierarchical(season_dict, bloom_df):
             )
 
         idx = int(jnp.clip(matching[11], 0, len(season_df) - 1))
-        bloom_indices.append(idx)
 
-        cultivar_idx.append(cultivar_to_int[row.cultivar_id])
-        location_idx.append(location_to_int[row.location_id])
+        if truncate_days_after_bloom is not None:
+            cutoff = min(idx + truncate_days_after_bloom * 24 + 1, len(season_df))
+            season_df = season_df.iloc[:cutoff]
+
+        raw_entries.append((
+            season_df,
+            idx,
+            cultivar_to_int[row.cultivar_id],
+            location_to_int[row.location_id],
+        ))
+
+    max_len = max(len(entry[0]) for entry in raw_entries)
+
+    # Second pass: pad to uniform length.
+    padded_temps  = []
+    padded_times  = []
+    bloom_indices = []
+    cultivar_idx  = []
+    location_idx  = []
+
+    for season_df, idx, c_idx, l_idx in raw_entries:
+        temp  = jnp.asarray(season_df.Temp.values, dtype=jnp.float32)
+        t_idx = jnp.arange(len(temp), dtype=jnp.float32)
+        pad   = max_len - len(temp)
+
+        padded_temps.append(
+            jnp.pad(temp, (0, pad), mode="edge") if pad else temp
+        )
+        padded_times.append(
+            jnp.concatenate([t_idx, t_idx[-1] + jnp.arange(1, pad + 1, dtype=jnp.float32)])
+            if pad else t_idx
+        )
+        bloom_indices.append(idx)
+        cultivar_idx.append(c_idx)
+        location_idx.append(l_idx)
 
     return (
         jnp.stack(padded_temps),                        # (S, T)
@@ -443,3 +463,134 @@ def run_inference(model, args, rng_key, dat):
     az_mcmc = az.from_numpyro(mcmc)
     print("\nMCMC elapsed time:", time.time() - start)
     return mcmc, mcmc.get_samples(), az_mcmc
+
+
+#phenoflex model optimized for faster calculation
+def phenoflex_numpyro_hierarchical_slim(
+    temp,
+    times,
+    cultivar_idx,        # int array (num_seasons,) — which cultivar each season belongs to
+    cultivar_to_species, # int array (num_cultivars,) — maps cultivar → species
+    bloom_index=None,
+    Imodel=0,
+    deg_celsius=True,
+    #return_traces=False,
+    priors=None,
+    n_species=None,
+    n_cultivars=None,
+):
+    # User-supplied priors overwrite defaults — anything not supplied keeps its default
+    p = {**DEFAULT_PRIORS, **(priors or {})}
+
+    # ── Sampling ───────────────────────────────────────────────────────────────
+    if n_species is None:
+        n_species   = int(np.array(cultivar_to_species).max()) + 1
+    if n_cultivars is None:
+        n_cultivars = int(np.array(cultivar_idx).max()) + 1
+
+    E0    = numpyro.sample("E0",    p["E0"])
+    E1    = numpyro.sample("E1",    p["E1"])
+    A0    = numpyro.sample("A0",    p["A0"])
+    A1    = numpyro.sample("A1",    p["A1"])
+    Tf    = numpyro.sample("Tf",    p["Tf"])
+    slope = numpyro.sample("slope", p["slope"])
+    Tb    = numpyro.sample("Tb",    p["Tb"])
+    Tu    = numpyro.sample("Tu",    p["Tu"])
+    Tc    = numpyro.sample("Tc",    p["Tc"])
+    Delta = numpyro.sample("Delta", p["Delta"])
+    k     = numpyro.sample("k",     p["k"])
+    s1    = numpyro.sample("s1",    p["s1"])
+
+    with numpyro.plate("species", n_species):
+        yc_species = numpyro.sample("yc_species", p["yc_species"])
+        zc_species = numpyro.sample("zc_species", p["zc_species"])
+
+    yc_sigma = numpyro.sample("yc_sigma", p["yc_sigma"])
+    zc_sigma = numpyro.sample("zc_sigma", p["zc_sigma"])
+
+    with numpyro.plate("cultivars", n_cultivars):
+        yc_offset = numpyro.sample("yc_offset", p["yc_offset"])
+        zc_offset = numpyro.sample("zc_offset", p["zc_offset"])
+
+    # Actual cultivar values: species mean + scaled offset
+    yc_cultivar = yc_species[cultivar_to_species] + yc_sigma * yc_offset  # (n_cultivars,)
+    zc_cultivar = zc_species[cultivar_to_species] + zc_sigma * zc_offset  # (n_cultivars,)
+
+    # Register for posterior inspection
+    #numpyro.deterministic("yc_cultivar", yc_cultivar)
+    #numpyro.deterministic("zc_cultivar", zc_cultivar)
+
+    # ── Index into per-season cultivar params ─────────────────────────────────
+    # Each season gets its cultivar's yc and zc
+    yc = yc_cultivar[cultivar_idx]   # (num_seasons,)
+    zc = zc_cultivar[cultivar_idx]   # (num_seasons,)
+
+    # Register per-season yc and zc for posterior inspection
+    #numpyro.deterministic("yc", yc)
+    #numpyro.deterministic("zc", zc)
+
+    # ── Everything below is unchanged ─────────────────────────────────────────
+    if temp.ndim == 1:
+        temp  = temp[None, :]
+        times = times[None, :]
+        if bloom_index is not None:
+            bloom_index = jnp.atleast_1d(bloom_index)
+
+    num_seasons = temp.shape[0]
+    offset = 273.0 if deg_celsius else 0.0
+    _Tf = Tf + offset
+    _Tu = Tu + offset
+    _Tc = Tc + offset
+    _Tb = Tb + offset
+
+    dt = times[:, 1:] - times[:, :-1]
+
+    def transition(carry, inputs):
+        x_prev, y_prev, z_prev = carry
+        ti_raw, dt_i = inputs
+        ti   = ti_raw + offset
+        xs_i = A0 / A1 * jnp.exp(-(E0 - E1) / ti)
+        k1   = A1 * jnp.exp(-E1 / ti)
+        x_new = xs_i - (xs_i - x_prev) * jnp.exp(-k1 * dt_i)
+        y_new = y_prev
+        heat_rate = _p1z_jax(ti, _Tu, _Tb, _Tc) if Imodel == 0 else _p2z_jax(ti, _Tu, Delta)
+
+        # yc and zc are now (num_seasons,) — broadcast correctly via y_prev
+        z_new = z_prev + heat_rate * _pfcn_jax(y_prev, yc, s1) * dt_i
+
+        delta   = _pfcn_jax(ti, _Tf, slope) * x_new
+        convert = jnp.where(x_new >= 1.0, 1.0, 0.0)
+        y_new   = y_new + convert * delta
+        x_new   = x_new - convert * delta
+        return (x_new, y_new, z_new), z_new
+
+    #only trace heat accumulation (z) to save memory, since x and y are intermediate states we don't need to keep track of for bloom prediction
+    init   = (jnp.zeros(num_seasons), jnp.zeros(num_seasons), jnp.zeros(num_seasons))
+    inputs = (temp[:, :-1].T, dt.T)
+    (_, _, _), z_trace = lax.scan(transition, init, inputs)
+    z_trace = z_trace.T
+
+
+    log_liks = jax.vmap(
+        lambda z, t, threshold, sharpness: discrete_hazard_loglik(z, t, threshold, sharpness),
+        in_axes=(0, 0, 0, None) # z_trace, bloom_index, zc are batched, k is constant
+    )(z_trace, bloom_index, zc, k)
+    numpyro.factor("bloom_obs", jnp.sum(log_liks))
+
+# Define a wrapper function that passes custom_priors to the model
+def phenoflex_model_with_custom_priors_slim(temp, times, cultivar_idx, cultivar_to_species,
+                                       custom_priors, # ← new argument for custom priors
+                                     bloom_index=None, Imodel=0, deg_celsius=True,
+                                       n_species=None, n_cultivars=None):
+    return phenoflex_numpyro_hierarchical_slim(
+        temp=temp,
+        times=times,
+        cultivar_idx=cultivar_idx,
+        cultivar_to_species=cultivar_to_species,
+        bloom_index=bloom_index,
+        Imodel=Imodel,
+        deg_celsius=deg_celsius,
+        priors=custom_priors, # Pass custom_priors here
+        n_species=n_species,       # ← pass through
+        n_cultivars=n_cultivars,   # ← pass through
+    )    
